@@ -1,7 +1,7 @@
 """
 High-Performance, Memory-Safe Training & Threshold Tuning Pipeline.
 Supports Multi-Match Entity Resolution, Fine-Grained Threshold Sweeping (0.15 - 0.55),
-Channel Provenance Prior, and Transitive Graph Propagation to push Macro F0.5 > 0.96.
+Channel Provenance Prior, and Full 1.73M Test Set Streaming Inference.
 """
 from __future__ import annotations
 import gc
@@ -26,6 +26,7 @@ from src.business_entity_resolution.features.pair_features import build_pair_fea
 from src.business_entity_resolution.models.model import EnsembleMatcher
 from src.business_entity_resolution.evaluation.metrics import macro_f_beta
 from src.business_entity_resolution.inference.predict import predict, write_outputs
+from src.business_entity_resolution.inference.fast_test_inference import run_full_test_inference
 
 
 def find_dataset_dir() -> tuple[Path, Path]:
@@ -192,7 +193,7 @@ def main():
 
     config["threshold"]["value"] = best_thresh
 
-    print("\nWriting validation output predictions...")
+    print("\nWriting submission predictions...")
     output_dir = ROOT_DIR / "output"
     os.makedirs(output_dir, exist_ok=True)
 
@@ -201,13 +202,16 @@ def main():
     test_s3_files = list(test_dir.glob("*source3.tsv"))
 
     if test_s1_files and test_s2_files and test_s3_files:
-        print(f"  Running inference on real test dataset at {test_dir}...")
-        test_s1 = load_tsv(str(test_s1_files[0]), expected_prefix="S1")
-        print(f"  Test S1 entities to predict: {len(test_s1):,}")
-        test_s2 = load_candidate_pool(test_s2_files[0], needed_ids=set(), sample_negatives=60000)
-        test_s3 = load_candidate_pool(test_s3_files[0], needed_ids=set(), sample_negatives=60000)
-        matching_res, candidate_res = predict(test_s1, test_s2, test_s3, model, config, known_train_countries=known_countries)
-        write_outputs(matching_res, candidate_res, output_dir=str(output_dir))
+        print(f"\n[Test Inference] Running streaming inference on complete test dataset at {test_dir}...")
+        run_full_test_inference(
+            test_s1_path=test_s1_files[0],
+            test_s2_path=test_s2_files[0],
+            test_s3_path=test_s3_files[0],
+            model=model,
+            threshold=best_thresh,
+            output_dir=output_dir,
+            known_train_countries=known_countries
+        )
     else:
         print("  Generating submission output on validation records...")
         matching_res, candidate_res = predict(s1_df, s2_df, s3_df, model, config, known_train_countries=known_countries)
