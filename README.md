@@ -88,3 +88,42 @@ from.
 6. Upload `output/matching_results.tsv` to the leaderboard; package the full submission
    zip per the problem statement's Final Submission Package structure, including
    `docs/architecture.md`-informed methodology notes in `Documentation_template.md`.
+
+---
+
+## 📦 Getting the Dataset
+
+The full dataset (~1 GB) is **NOT in this repo** (gitignored — too large for GitHub).
+
+### Step 1 — Download the zip
+Get it from **one of these sources**:
+- **Amazon ML Challenge portal** — log in and download the student resource zip directly
+- **Google Drive (team shared link)** — ask the team lead for the link
+
+### Step 2 — Extract into the right folders
+
+**Windows (PowerShell):**
+```powershell
+Expand-Archive -Path "student_resource.zip" -DestinationPath "." -Force
+```
+
+**Mac/Linux:**
+```bash
+unzip student_resource.zip
+```
+
+### Step 3 — Place TSVs like this:
+```
+data/
+├── train/
+│   ├── train_source1.tsv
+│   ├── train_source2.tsv
+│   ├── train_source3.tsv
+│   └── train_ground_truth.tsv
+└── test/
+    ├── test_source1.tsv
+    ├── test_source2.tsv
+    └── test_source3.tsv
+```
+
+> ⚠️ **Never `git add` files inside `data/train/` or `data/test/`** — they are in `.gitignore` and must never be committed to this repo.
