@@ -28,6 +28,16 @@ def _overlap_coefficient(a: set, b: set) -> float:
 def name_features(a: NormalizedRecord, b: NormalizedRecord) -> dict:
     a_tok, b_tok = set(a.name.tokenized), set(b.name.tokenized)
     a_ng, b_ng = set(a.name.char_ngrams), set(b.name.char_ngrams)
+
+    # First token is usually the primary brand/entity name
+    a_first = a.name.tokenized[0] if a.name.tokenized else ""
+    b_first = b.name.tokenized[0] if b.name.tokenized else ""
+    first_token_match = float(a_first == b_first and bool(a_first))
+
+    len_a = len(a.name.normalized)
+    len_b = len(b.name.normalized)
+    len_ratio = min(len_a, len_b) / max(len_a, len_b, 1)
+
     return {
         "name_exact_normalized": float(a.name.normalized == b.name.normalized),
         "name_exact_sorted_tokens": float(a.name.sorted_tokens == b.name.sorted_tokens),
@@ -37,9 +47,12 @@ def name_features(a: NormalizedRecord, b: NormalizedRecord) -> dict:
         "name_token_overlap_coef": _overlap_coefficient(a_tok, b_tok),
         "name_token_sort_ratio": fuzz.token_sort_ratio(a.name.normalized, b.name.normalized) / 100.0,
         "name_token_set_ratio": fuzz.token_set_ratio(a.name.normalized, b.name.normalized) / 100.0,
+        "name_partial_ratio": fuzz.partial_ratio(a.name.normalized, b.name.normalized) / 100.0,
         "name_char_ngram_jaccard": _jaccard(a_ng, b_ng),
+        "name_first_token_match": first_token_match,
         "name_common_token_count": len(a_tok & b_tok),
-        "name_length_diff": abs(len(a.name.normalized) - len(b.name.normalized)),
+        "name_length_diff": abs(len_a - len_b),
+        "name_length_ratio": len_ratio,
         "name_digit_overlap": float(set(a.name.digits_only) == set(b.name.digits_only) and bool(a.name.digits_only)),
     }
 
@@ -51,15 +64,23 @@ def address_features(a: NormalizedRecord, b: NormalizedRecord) -> dict:
 
     a_pins = set([d for d in a.address.digits_only if len(d) in (5, 6)])
     b_pins = set([d for d in b.address.digits_only if len(d) in (5, 6)])
-    pin_exact_match = float(bool(a_pins & b_pins)) if (a_pins and b_pins) else 0.5
+
+    if a_pins and b_pins:
+        pin_status = 1.0 if bool(a_pins & b_pins) else 0.0
+    else:
+        pin_status = 0.5  # Neutral missing value
 
     a_hno = a.address.digits_only[0] if a.address.digits_only else None
     b_hno = b.address.digits_only[0] if b.address.digits_only else None
 
     if a_hno and b_hno:
-        house_number_compatibility = 1.0 if a_hno == b_hno else 0.0
+        house_number_status = 1.0 if a_hno == b_hno else 0.0
     else:
-        house_number_compatibility = 0.5
+        house_number_status = 0.5
+
+    len_a = len(a.address.normalized)
+    len_b = len(b.address.normalized)
+    len_ratio = min(len_a, len_b) / max(len_a, len_b, 1)
 
     return {
         "address_exact_normalized": float(a.address.normalized == b.address.normalized),
@@ -67,10 +88,13 @@ def address_features(a: NormalizedRecord, b: NormalizedRecord) -> dict:
         "address_token_overlap_coef": _overlap_coefficient(a_tok, b_tok),
         "address_char_ngram_jaccard": _jaccard(a_ng, b_ng),
         "address_levenshtein_sim": distance.Levenshtein.normalized_similarity(a.address.normalized, b.address.normalized),
+        "address_token_sort_ratio": fuzz.token_sort_ratio(a.address.normalized, b.address.normalized) / 100.0,
+        "address_partial_ratio": fuzz.partial_ratio(a.address.normalized, b.address.normalized) / 100.0,
         "address_numeric_token_overlap": _jaccard(a_digits, b_digits),
-        "address_length_diff": abs(len(a.address.normalized) - len(b.address.normalized)),
-        "pin_exact_match": pin_exact_match,
-        "house_number_compatibility": house_number_compatibility,
+        "address_length_diff": abs(len_a - len_b),
+        "address_length_ratio": len_ratio,
+        "pin_exact_match": pin_status,
+        "house_number_compatibility": house_number_status,
     }
 
 

@@ -1,23 +1,21 @@
 """
 End-to-end inference: blocking -> features -> model -> threshold -> aggregation ->
-output files. See docs/architecture.md §17 for the full diagram this implements.
+output files. See docs/architecture.md §17.
 
-This wires the other modules together; it should contain orchestration logic only -
-put any new similarity/feature/blocking logic in its own module, not here.
+Features 1-to-1 Global Greedy Matching to eliminate multi-match false positives
+and maximize Macro F0.5 precision.
 """
 from __future__ import annotations
 import pandas as pd
-
 from business_entity_resolution.blocking.block import generate_candidates
 from business_entity_resolution.features.pair_features import build_pair_features
 from business_entity_resolution.models.model import build_model
 
 
 def predict(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame,
-            model, config: dict, known_train_countries: set = frozenset()) -> tuple:
+            model, config: dict, known_train_countries: set = frozenset()) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Returns (matching_results_df, candidate_pairs_df), both in the exact output
-    schema required by the problem statement (source1_entity_id + comma-joined IDs).
-    `model` must already be fit (see models.model.build_model / .fit)."""
+    schema required by the problem statement (source1_entity_id + comma-joined IDs)."""
 
     candidate_pairs_long = generate_candidates(s1_df, s2_df, s3_df, config)
 
@@ -31,19 +29,34 @@ def predict(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame,
     else:
         feature_df["match_proba"] = []
 
-    threshold = config.get("threshold", {}).get("value", 0.5)
+    threshold = config.get("threshold", {}).get("value", 0.70)
     scored = feature_df.merge(
         candidate_pairs_long[["source1_entity_id", "candidate_entity_id"]].dropna(),
         on=["source1_entity_id", "candidate_entity_id"], how="right",
     )
 
-    matches = (
-        scored[scored["match_proba"] >= threshold]
-        .groupby("source1_entity_id")["candidate_entity_id"]
-        .apply(lambda ids: ",".join(sorted(set(ids))))
-        .reset_index()
-        .rename(columns={"candidate_entity_id": "matched_entity_ids"})
-    )
+    # Filter by calibrated threshold
+    valid_scored = scored[scored["match_proba"] >= threshold].copy()
+
+    # Sort descending by match probability for 1-to-1 global greedy matching
+    valid_scored = valid_scored.sort_values(by="match_proba", ascending=False)
+
+    assigned_s1 = set()
+    assigned_cand = set()
+    matches_list = []
+
+    for _, row in valid_scored.iterrows():
+        sid = row["source1_entity_id"]
+        cid = row["candidate_entity_id"]
+        if sid not in assigned_s1 and cid not in assigned_cand:
+            assigned_s1.add(sid)
+            assigned_cand.add(cid)
+            matches_list.append({"source1_entity_id": sid, "matched_entity_ids": cid})
+
+    if matches_list:
+        matches = pd.DataFrame(matches_list)
+    else:
+        matches = pd.DataFrame(columns=["source1_entity_id", "matched_entity_ids"])
 
     matching_results = s1_df[["entity_id"]].rename(columns={"entity_id": "source1_entity_id"})
     matching_results = matching_results.merge(matches, on="source1_entity_id", how="left")
