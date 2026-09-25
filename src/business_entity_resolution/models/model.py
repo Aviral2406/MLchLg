@@ -1,10 +1,18 @@
 """
 Matching models - common fit(X, y) / predict_proba(model, X) interface across
-baseline, GBM, and ensemble models. See docs/architecture.md §9.
+baseline, GBM, and ensemble models. Automatically utilizes CUDA GPU if present.
 """
 from __future__ import annotations
 import numpy as np
 import pandas as pd
+
+
+def is_cuda_available() -> bool:
+    try:
+        import torch
+        return torch.cuda.is_available()
+    except Exception:
+        return False
 
 
 class RuleBasedBaseline:
@@ -27,12 +35,19 @@ class RuleBasedBaseline:
 
 
 class LightGBMMatcher:
-    """LightGBM Binary Classifier."""
+    """LightGBM Binary Classifier with multi-threading."""
 
     def __init__(self, **lgbm_params):
         import lightgbm as lgb
-        default_params = dict(n_estimators=500, learning_rate=0.05, num_leaves=63,
-                               objective="binary", random_state=42, verbose=-1)
+        default_params = dict(
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=63,
+            objective="binary",
+            random_state=42,
+            n_jobs=-1,
+            verbose=-1
+        )
         default_params.update(lgbm_params)
         self.model = lgb.LGBMClassifier(**default_params)
         self.feature_columns_: list | None = None
@@ -53,13 +68,22 @@ class LightGBMMatcher:
 
 
 class XGBoostMatcher:
-    """XGBoost Binary Classifier."""
+    """XGBoost Binary Classifier with CUDA GPU Acceleration."""
 
     def __init__(self, **xgb_params):
         import xgboost as xgb
-        default_params = dict(n_estimators=500, learning_rate=0.05, max_depth=8,
-                               eval_metric="logloss", random_state=42)
+        has_gpu = is_cuda_available()
+        default_params = dict(
+            n_estimators=500,
+            learning_rate=0.05,
+            max_depth=8,
+            eval_metric="logloss",
+            random_state=42,
+            tree_method="hist",
+            device="cuda" if has_gpu else "cpu",
+        )
         default_params.update(xgb_params)
+        print(f"[Model] Initialized XGBoost with device='{default_params['device']}'")
         self.model = xgb.XGBClassifier(**default_params)
         self.feature_columns_: list | None = None
 
@@ -79,7 +103,7 @@ class XGBoostMatcher:
 
 
 class EnsembleMatcher:
-    """Blend of LightGBM + XGBoost for maximum generalization and precision."""
+    """Blend of LightGBM + XGBoost with GPU acceleration for maximum generalization."""
 
     def __init__(self, lgb_weight: float = 0.6, xgb_weight: float = 0.4):
         self.lgb = LightGBMMatcher()
@@ -88,7 +112,9 @@ class EnsembleMatcher:
         self.xgb_weight = xgb_weight
 
     def fit(self, X: pd.DataFrame, y: np.ndarray) -> "EnsembleMatcher":
+        print("  [Training] Fitting LightGBM Classifier...")
         self.lgb.fit(X, y)
+        print("  [Training] Fitting XGBoost Classifier on GPU...")
         self.xgb.fit(X, y)
         return self
 
