@@ -1,7 +1,7 @@
 """
 High-Performance, Memory-Safe Training & Threshold Tuning Pipeline.
-Guaranteed to run under 4 GB RAM (less than 15% of Kaggle's 30 GB limit) with CUDA GPU acceleration.
-Targeting Macro F0.5 > 0.96 with 1-to-1 Global Greedy Matching.
+Supports Multi-Match Entity Resolution to maximize Macro F0.5 > 0.96.
+Auto-detects Kaggle GPU environment and test paths for official validation.
 """
 from __future__ import annotations
 import gc
@@ -9,6 +9,7 @@ import os
 import sys
 import yaml
 from pathlib import Path
+from collections import defaultdict
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
@@ -30,10 +31,13 @@ def find_dataset_dir() -> tuple[Path, Path]:
     """Finds train and test directories on Kaggle or local workspace."""
     kaggle_input = Path("/kaggle/input")
     if kaggle_input.exists():
-        for s1_file in kaggle_input.glob("**/train_source1.tsv"):
-            train_dir = s1_file.parent
-            test_dir = train_dir.parent / "test" if (train_dir.parent / "test").exists() else train_dir
-            print(f"[Environment] Detected Kaggle dataset at {train_dir}")
+        train_matches = list(kaggle_input.glob("**/train_source1.tsv"))
+        test_matches = list(kaggle_input.glob("**/test_source1.tsv"))
+        if train_matches:
+            train_dir = train_matches[0].parent
+            test_dir = test_matches[0].parent if test_matches else (train_dir.parent / "test")
+            print(f"[Environment] Detected Kaggle train dir: {train_dir}")
+            print(f"[Environment] Detected Kaggle test dir: {test_dir}")
             return train_dir, test_dir
 
     local_train = ROOT_DIR / "data" / "train"
@@ -48,7 +52,7 @@ def find_dataset_dir() -> tuple[Path, Path]:
     return fixture_train, fixture_test
 
 
-def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 25000) -> pd.DataFrame:
+def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 35000) -> pd.DataFrame:
     """Streams candidate files in small chunks to extract only required true positives
     plus controlled background negatives. Keeps peak memory under 500 MB.
     """
@@ -56,15 +60,13 @@ def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 250
     chunks = []
     chunk_idx = 0
     for chunk in pd.read_csv(str(path), sep="\t", dtype=str, keep_default_na=False, chunksize=200000):
-        # Match true positive candidates
         matched = chunk[chunk["entity_id"].isin(needed_ids)]
         if not matched.empty:
             chunks.append(matched)
-        # Sample a small fraction of negatives per chunk
         if sample_negatives > 0 and chunk_idx < 15:
             unmatched = chunk[~chunk["entity_id"].isin(needed_ids)]
             if not unmatched.empty:
-                sample_n = min(len(unmatched), 1500)
+                sample_n = min(len(unmatched), 2500)
                 chunks.append(unmatched.sample(n=sample_n, random_state=42))
         chunk_idx += 1
 
@@ -76,7 +78,7 @@ def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 250
 def main():
     print("=" * 70)
     print("=== Amazon ML Challenge: Business Entity Resolution Pipeline ===")
-    print("=== Optimized for High Precision & Target Macro F0.5 > 0.96 ===")
+    print("=== Multi-Match High Precision Model (Target Macro F0.5 > 0.96) ===")
     print("=" * 70)
 
     config_path = ROOT_DIR / "configs" / "pipeline.yaml"
@@ -99,7 +101,7 @@ def main():
     s1_df = load_tsv(str(s1_path), expected_prefix="S1")
     gt_df = load_tsv(str(gt_path))
 
-    # Stratified sample of 35,000 S1 records (ideal balance of memory & deep learning convergence)
+    # Stratified sample of 35,000 S1 records
     TRAIN_SAMPLE_SIZE = 35000
     if len(s1_df) > TRAIN_SAMPLE_SIZE:
         print(f"  Selecting {TRAIN_SAMPLE_SIZE:,} stratified S1 records for training...")
@@ -109,23 +111,27 @@ def main():
 
     needed_match_ids = set()
     gt_pairs = set()
+    gt_dict = defaultdict(set)
     for _, row in gt_df.iterrows():
+        sid = str(row["source1_entity_id"])
         mids = str(row["matched_entity_ids"] or "")
         if mids and mids != "nan":
             for m in mids.split(","):
                 m_clean = m.strip()
                 if m_clean:
                     needed_match_ids.add(m_clean)
-                    gt_pairs.add((str(row["source1_entity_id"]), m_clean))
+                    gt_pairs.add((sid, m_clean))
+                    gt_dict[sid].add(m_clean)
 
-    print(f"  True positive match pairs to recover: {len(gt_pairs):,}")
+    print(f"  Total true match pairs for training: {len(gt_pairs):,}")
+    print(f"  Avg matches per S1 entity: {len(gt_pairs) / len(s1_df):.2f}")
 
     print("\n[Step 2/6] Loading Candidate Pools with Streaming Chunks...")
-    s2_df = load_candidate_pool(s2_path, needed_match_ids, sample_negatives=20000)
-    s3_df = load_candidate_pool(s3_path, needed_match_ids, sample_negatives=20000)
+    s2_df = load_candidate_pool(s2_path, needed_match_ids, sample_negatives=35000)
+    s3_df = load_candidate_pool(s3_path, needed_match_ids, sample_negatives=35000)
     gc.collect()
 
-    print("\n[Step 3/6] Generating Candidates (Memory-Capped 5-Channel Blocking)...")
+    print("\n[Step 3/6] Generating Candidates (Enhanced 5-Channel Blocking)...")
     cands_df = generate_candidates(s1_df, s2_df, s3_df, config)
     blocking_stats = evaluate_blocking_recall(cands_df, gt_df)
     print(f"  >>> Candidate Recall: {blocking_stats['recall']:.2%} <<<")
@@ -150,28 +156,24 @@ def main():
     model.fit(feature_df[feature_cols], labels)
     gc.collect()
 
-    print("\n[Step 6/6] Threshold Calibration for Macro F0.5 (with 1-to-1 Greedy Matching)...")
+    print("\n[Step 6/6] Multi-Match Threshold Calibration for Macro F0.5...")
     scores = model.predict_proba(feature_df[feature_cols])
     feature_df["score"] = scores
 
-    best_thresh = 0.70
+    best_thresh = 0.65
     best_f05 = 0.0
 
-    gt_dict = {sid: set() for sid in s1_df["entity_id"]}
-    for sid, cid in gt_pairs:
-        gt_dict[sid].add(cid)
+    # Ensure all S1 entities have an entry in gt_dict (including singletons)
+    for sid in s1_df["entity_id"]:
+        if sid not in gt_dict:
+            gt_dict[sid] = set()
 
-    for th in np.arange(0.60, 0.95, 0.05):
-        valid_sub = feature_df[feature_df["score"] >= th].sort_values(by="score", ascending=False)
+    for th in np.arange(0.40, 0.90, 0.05):
+        valid_sub = feature_df[feature_df["score"] >= th]
         pred_dict = {sid: set() for sid in s1_df["entity_id"]}
-        assigned_cands = set()
 
-        for _, r in valid_sub.iterrows():
-            sid = r["source1_entity_id"]
-            cid = r["candidate_entity_id"]
-            if not pred_dict[sid] and cid not in assigned_cands:
-                pred_dict[sid].add(cid)
-                assigned_cands.add(cid)
+        for sid, cid in zip(valid_sub["source1_entity_id"], valid_sub["candidate_entity_id"]):
+            pred_dict[sid].add(cid)
 
         f05 = macro_f_beta(pred_dict, gt_dict, beta=0.5)
         print(f"  Threshold {th:.2f} -> Macro F0.5 = {f05:.4f}")
@@ -188,17 +190,33 @@ def main():
     print("\nWriting validation output predictions...")
     output_dir = ROOT_DIR / "output"
     os.makedirs(output_dir, exist_ok=True)
-    matching_res, candidate_res = predict(s1_df, s2_df, s3_df, model, config, known_train_countries=known_countries)
-    write_outputs(matching_res, candidate_res, output_dir=str(output_dir))
 
-    print("\nValidating official submission structure...")
+    test_s1_files = list(test_dir.glob("*source1.tsv"))
+    test_s2_files = list(test_dir.glob("*source2.tsv"))
+    test_s3_files = list(test_dir.glob("*source3.tsv"))
+
+    if test_s1_files and test_s2_files and test_s3_files:
+        print(f"  Running inference on real test dataset at {test_dir}...")
+        test_s1 = load_tsv(str(test_s1_files[0]), expected_prefix="S1")
+        # Subsample or run inference
+        print(f"  Test S1 entities to predict: {len(test_s1):,}")
+        test_s2 = load_candidate_pool(test_s2_files[0], needed_ids=set(), sample_negatives=50000)
+        test_s3 = load_candidate_pool(test_s3_files[0], needed_ids=set(), sample_negatives=50000)
+        matching_res, candidate_res = predict(test_s1, test_s2, test_s3, model, config, known_train_countries=known_countries)
+        write_outputs(matching_res, candidate_res, output_dir=str(output_dir))
+    else:
+        print("  Generating submission output on validation records...")
+        matching_res, candidate_res = predict(s1_df, s2_df, s3_df, model, config, known_train_countries=known_countries)
+        write_outputs(matching_res, candidate_res, output_dir=str(output_dir))
+
+    print("\nValidating submission structure with official validator...")
     import subprocess
     cmd = [
         sys.executable,
         str(ROOT_DIR / "utils" / "validate_submission.py"),
         "--matching", str(output_dir / "matching_results.tsv"),
         "--candidate", str(output_dir / "candidate_pairs.tsv"),
-        "--test-dir", str(train_dir),
+        "--test-dir", str(test_dir if (test_dir / "test_source1.tsv").exists() else train_dir),
     ]
     proc = subprocess.run(cmd, capture_output=True, text=True)
     print(proc.stdout)

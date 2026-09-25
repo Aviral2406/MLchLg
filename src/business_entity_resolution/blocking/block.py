@@ -20,7 +20,7 @@ STOPWORDS = frozenset({
     "enterprise", "services", "india", "us", "usa"
 })
 
-MAX_CANDIDATES_PER_CHANNEL = 15
+MAX_CANDIDATES_PER_CHANNEL = 35
 
 
 def _normalize_all(df: pd.DataFrame) -> dict[str, NormalizedRecord]:

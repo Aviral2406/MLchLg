@@ -2,8 +2,8 @@
 End-to-end inference: blocking -> features -> model -> threshold -> aggregation ->
 output files. See docs/architecture.md §17.
 
-Features 1-to-1 Global Greedy Matching to eliminate multi-match false positives
-and maximize Macro F0.5 precision.
+Supports multi-match entity resolution where an S1 entity can match multiple
+corresponding records across Source 2 and Source 3.
 """
 from __future__ import annotations
 import pandas as pd
@@ -35,26 +35,17 @@ def predict(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame,
         on=["source1_entity_id", "candidate_entity_id"], how="right",
     )
 
-    # Filter by calibrated threshold
+    # Filter candidates exceeding the calibrated high-precision threshold
     valid_scored = scored[scored["match_proba"] >= threshold].copy()
 
-    # Sort descending by match probability for 1-to-1 global greedy matching
-    valid_scored = valid_scored.sort_values(by="match_proba", ascending=False)
-
-    assigned_s1 = set()
-    assigned_cand = set()
-    matches_list = []
-
-    for _, row in valid_scored.iterrows():
-        sid = row["source1_entity_id"]
-        cid = row["candidate_entity_id"]
-        if sid not in assigned_s1 and cid not in assigned_cand:
-            assigned_s1.add(sid)
-            assigned_cand.add(cid)
-            matches_list.append({"source1_entity_id": sid, "matched_entity_ids": cid})
-
-    if matches_list:
-        matches = pd.DataFrame(matches_list)
+    # Collect ALL confident candidate matches per S1 entity
+    if not valid_scored.empty:
+        matches = (
+            valid_scored.groupby("source1_entity_id")["candidate_entity_id"]
+            .apply(lambda ids: ",".join(sorted(set(ids))))
+            .reset_index()
+            .rename(columns={"candidate_entity_id": "matched_entity_ids"})
+        )
     else:
         matches = pd.DataFrame(columns=["source1_entity_id", "matched_entity_ids"])
 
