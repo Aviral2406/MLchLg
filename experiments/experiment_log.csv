@@ -1,0 +1,1 @@
+exp_id,date,blocking_channels,features,neg_sampling,model,hyperparams,cv_strategy,threshold,blocking_recall,pairwise_precision,pairwise_recall,entity_precision,entity_recall,entity_f0.5,singleton_f0.5,avg_candidates_per_s1,train_time_sec,infer_time_sec,git_commit,notes

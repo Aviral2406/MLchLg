@@ -1,0 +1,30 @@
+# Core
+pandas>=2.0
+numpy>=1.24
+scipy>=1.11
+scikit-learn>=1.3
+pyyaml>=6.0
+tqdm>=4.66
+
+# String similarity (C-backed, fast — see docs/architecture.md §22)
+rapidfuzz>=3.5
+
+# Models (all MIT/Apache-2.0 licensed, satisfy the <=8B param constraint trivially)
+lightgbm>=4.0
+xgboost>=2.0
+# catboost>=1.2          # optional alternative GBM
+
+# ANN retrieval for character n-gram blocking at scale (docs/architecture.md §4/§22)
+# hnswlib>=0.8           # uncomment if brute-force cosine retrieval becomes a bottleneck
+
+# EDA / notebooks
+matplotlib>=3.7
+seaborn>=0.12
+jupyter>=1.0
+
+# Optional — only if the small-encoder embedding feature (architecture.md §9-E) is adopted.
+# Verify the exact checkpoint license is MIT/Apache-2.0 before use.
+# sentence-transformers>=2.2
+
+# Testing
+pytest>=7.4
