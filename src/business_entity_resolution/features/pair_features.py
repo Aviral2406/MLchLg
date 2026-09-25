@@ -2,10 +2,7 @@
 Pairwise feature engineering. See docs/architecture.md §6.
 
 Consumes NORMALIZED records only (via normalization.normalize) - never re-derive
-similarity from raw strings here. A representative subset of features is implemented
-below (name + address string/token similarity, country compatibility, one cross-field
-interaction). Extend following the same pattern - see docs/task_specs.md "Pair
-Features" for the full target feature list and priority order.
+similarity from raw strings here.
 """
 from __future__ import annotations
 import pandas as pd
@@ -51,6 +48,19 @@ def address_features(a: NormalizedRecord, b: NormalizedRecord) -> dict:
     a_tok, b_tok = set(a.address.tokenized), set(b.address.tokenized)
     a_ng, b_ng = set(a.address.char_ngrams), set(b.address.char_ngrams)
     a_digits, b_digits = set(a.address.digits_only), set(b.address.digits_only)
+
+    a_pins = set([d for d in a.address.digits_only if len(d) in (5, 6)])
+    b_pins = set([d for d in b.address.digits_only if len(d) in (5, 6)])
+    pin_exact_match = float(bool(a_pins & b_pins)) if (a_pins and b_pins) else 0.5
+
+    a_hno = a.address.digits_only[0] if a.address.digits_only else None
+    b_hno = b.address.digits_only[0] if b.address.digits_only else None
+
+    if a_hno and b_hno:
+        house_number_compatibility = 1.0 if a_hno == b_hno else 0.0
+    else:
+        house_number_compatibility = 0.5
+
     return {
         "address_exact_normalized": float(a.address.normalized == b.address.normalized),
         "address_token_jaccard": _jaccard(a_tok, b_tok),
@@ -59,17 +69,12 @@ def address_features(a: NormalizedRecord, b: NormalizedRecord) -> dict:
         "address_levenshtein_sim": distance.Levenshtein.normalized_similarity(a.address.normalized, b.address.normalized),
         "address_numeric_token_overlap": _jaccard(a_digits, b_digits),
         "address_length_diff": abs(len(a.address.normalized) - len(b.address.normalized)),
-        # TODO: pin_exact_match, pin_missing_flags, city_token_match, state_token_match,
-        # house_number_compatibility, landmark_token_overlap - see docs/task_specs.md.
-        # These depend on the address_components soft-extraction from architecture.md §3,
-        # which should be implemented alongside normalization.normalize_field.
+        "pin_exact_match": pin_exact_match,
+        "house_number_compatibility": house_number_compatibility,
     }
 
 
 def country_features(a: NormalizedRecord, b: NormalizedRecord, known_train_countries: set = frozenset()) -> dict:
-    """known_train_countries: pass the set of country_normalized values seen in TRAIN
-    only, so the unseen-country flag is meaningful at test time (e.g. France).
-    Never fit a fixed-vocabulary encoder on this - see CLAUDE.md §2."""
     return {
         "country_exact_match": float(a.country_normalized == b.country_normalized),
         "country_a_missing": float(a.country_normalized == ""),
@@ -79,24 +84,32 @@ def country_features(a: NormalizedRecord, b: NormalizedRecord, known_train_count
     }
 
 
-def cross_field_features(name_feats: dict, address_feats: dict) -> dict:
+ALL_CHANNEL_NAMES = [
+    "exact_name", "name_token_overlap", "name_char_ngram",
+    "address_token_overlap", "pin_exact", "city_state_cooccurrence", "address_char_ngram"
+]
+
+
+def cross_field_features(name_feats: dict, address_feats: dict, channel_str: str = "") -> dict:
     name_sim = name_feats["name_char_ngram_jaccard"]
     addr_sim = address_feats["address_char_ngram_jaccard"]
+
+    ch_set = set(channel_str.split(",")) if channel_str else set()
+    provenance_feats = {f"ch_prov_{ch}": float(ch in ch_set) for ch in ALL_CHANNEL_NAMES}
+    provenance_feats["ch_count"] = len(ch_set)
+
     return {
         "name_x_address_sim_product": name_sim * addr_sim,
         "strong_name_weak_address": float(name_sim > 0.7 and addr_sim < 0.3),
         "weak_name_strong_address": float(name_sim < 0.3 and addr_sim > 0.7),
         "strong_name_strong_address": float(name_sim > 0.7 and addr_sim > 0.7),
-        # TODO: add blocking-provenance one-hot features once candidate_pairs_df's
-        # `channels` column is joined in by build_pair_features - see architecture.md §6.
+        **provenance_feats,
     }
 
 
 def build_pair_features(pairs_df: pd.DataFrame, s1_df: pd.DataFrame,
                          s2_df: pd.DataFrame, s3_df: pd.DataFrame,
                          known_train_countries: set = frozenset()) -> pd.DataFrame:
-    """pairs_df: [source1_entity_id, candidate_entity_id, channels] (candidate_pairs_df
-    from blocking.block.generate_candidates). Returns one feature row per pair."""
     s1_norm = {row["entity_id"]: normalize(row.to_dict()) for _, row in s1_df.iterrows()}
     cand_all = pd.concat([s2_df, s3_df], ignore_index=True)
     cand_norm = {row["entity_id"]: normalize(row.to_dict()) for _, row in cand_all.iterrows()}
@@ -104,13 +117,16 @@ def build_pair_features(pairs_df: pd.DataFrame, s1_df: pd.DataFrame,
     rows = []
     for _, row in pairs_df.iterrows():
         sid, cid = row["source1_entity_id"], row["candidate_entity_id"]
-        if cid is None or (isinstance(cid, float)):
-            continue  # S1 entity with no candidates - handled downstream as a forced singleton
+        ch_str = str(row.get("channels", "") or "")
+        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+            continue
+        if sid not in s1_norm or cid not in cand_norm:
+            continue
         a, b = s1_norm[sid], cand_norm[cid]
         nf = name_features(a, b)
         af = address_features(a, b)
         cf = country_features(a, b, known_train_countries)
-        xf = cross_field_features(nf, af)
+        xf = cross_field_features(nf, af, ch_str)
         rows.append({"source1_entity_id": sid, "candidate_entity_id": cid, **nf, **af, **cf, **xf})
 
     return pd.DataFrame(rows)

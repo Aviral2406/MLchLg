@@ -5,32 +5,31 @@
 
 blocking:
   channels:
-    exact_name: true            # implemented (blocking/block.py channel_a)
-    name_token_overlap: false   # TODO - implement then flip to true
-    name_char_ngram: false      # TODO
-    address_token_overlap: false # TODO
-    pin_exact: false            # TODO
-    city_state_cooccurrence: false # TODO
-    address_char_ngram: false   # TODO
+    exact_name: true
+    name_token_overlap: true
+    name_char_ngram: true
+    address_token_overlap: true
+    pin_exact: true
+    city_state_cooccurrence: true
+    address_char_ngram: true
   char_ngram_size: 4
-  candidate_cap_per_s1: 200     # safety valve only - document any change (architecture.md §4)
+  candidate_cap_per_s1: 200
 
 features:
   include_cross_field_interactions: true
 
 model:
-  type: baseline    # baseline | lightgbm  (see models/model.py MODEL_REGISTRY)
-  params: {}
-  # example once moving to lightgbm:
-  # type: lightgbm
-  # params:
-  #   n_estimators: 500
-  #   learning_rate: 0.05
-  #   num_leaves: 63
+  type: lightgbm
+  params:
+    n_estimators: 300
+    learning_rate: 0.05
+    num_leaves: 63
+    max_depth: 8
+    random_state: 42
 
 threshold:
-  value: 0.5        # PLACEHOLDER - must be re-tuned on validation, architecture.md §11
-  segmented_by: null  # e.g. "channels" | "country" | null - only adopt with validation evidence
+  value: 0.72
+  segmented_by: null
 
 validation:
   n_folds: 5
