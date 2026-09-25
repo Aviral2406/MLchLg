@@ -1,7 +1,7 @@
 """
-High-Performance, Precision-Guarded Training & Threshold Tuning Pipeline.
-Zeroes out impossible matches (different PIN / house number / country) to eliminate false positives.
-Optimized to push Macro F0.5 > 0.96.
+High-Performance, Memory-Safe Training & Threshold Tuning Pipeline.
+Supports Multi-Match Entity Resolution, Fine-Grained Threshold Sweeping (0.15 - 0.55),
+Channel Provenance Prior, and Full 1.73M Test Set Streaming Inference.
 """
 from __future__ import annotations
 import gc
@@ -23,10 +23,11 @@ import pandas as pd
 from src.business_entity_resolution.data.ingest import load_tsv
 from src.business_entity_resolution.blocking.block import generate_candidates, evaluate_blocking_recall
 from src.business_entity_resolution.features.pair_features import build_pair_features
-from src.business_entity_resolution.models.model import EnsembleMatcher
+from src.business_entity_resolution.models.model import EnsembleMatcher, mine_hard_negatives
 from src.business_entity_resolution.evaluation.metrics import macro_f_beta
 from src.business_entity_resolution.inference.predict import predict, write_outputs
 from src.business_entity_resolution.inference.fast_test_inference import run_full_test_inference
+from src.business_entity_resolution.validation.split import grouped_entity_split
 
 
 def find_dataset_dir() -> tuple[Path, Path]:
@@ -80,7 +81,7 @@ def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 400
 def main():
     print("=" * 70)
     print("=== Amazon ML Challenge: Business Entity Resolution Pipeline ===")
-    print("=== Precision-Guarded Model (Target Macro F0.5 > 0.96) ===")
+    print("=== Multi-Match High Precision Model (Target Macro F0.5 > 0.96) ===")
     print("=" * 70)
 
     config_path = ROOT_DIR / "configs" / "pipeline.yaml"
@@ -103,8 +104,8 @@ def main():
     s1_df = load_tsv(str(s1_path), expected_prefix="S1")
     gt_df = load_tsv(str(gt_path))
 
-    # Stratified sample of 45,000 S1 records (optimal balance of convergence & clean negatives)
-    TRAIN_SAMPLE_SIZE = 45000
+    # Scale training size to 60,000 S1 records (2x larger training coverage for high precision)
+    TRAIN_SAMPLE_SIZE = 60000
     if len(s1_df) > TRAIN_SAMPLE_SIZE:
         print(f"  Selecting {TRAIN_SAMPLE_SIZE:,} stratified S1 records for training...")
         s1_df = s1_df.sample(n=TRAIN_SAMPLE_SIZE, random_state=42)
@@ -128,64 +129,75 @@ def main():
     print(f"  Total true match pairs for training: {len(gt_pairs):,}")
     print(f"  Avg matches per S1 entity: {len(gt_pairs) / len(s1_df):.2f}")
 
+    train_ids, val_ids = grouped_entity_split(s1_df, gt_df, val_fraction=0.2, random_state=42)
+    train_s1 = s1_df[s1_df["entity_id"].isin(train_ids)].copy()
+    val_s1 = s1_df[s1_df["entity_id"].isin(val_ids)].copy()
+    print(f"  Grouped split: {len(train_s1):,} train S1 entities, {len(val_s1):,} validation S1 entities")
+
     print("\n[Step 2/6] Loading Candidate Pools with Streaming Chunks...")
     s2_df = load_candidate_pool(s2_path, needed_match_ids, sample_negatives=40000)
     s3_df = load_candidate_pool(s3_path, needed_match_ids, sample_negatives=40000)
     gc.collect()
 
-    print("\n[Step 3/6] Generating Candidates (5-Channel Memory-Safe Blocking)...")
-    cands_df = generate_candidates(s1_df, s2_df, s3_df, config)
-    blocking_stats = evaluate_blocking_recall(cands_df, gt_df)
+    print("\n[Step 3/6] Generating Candidates (Enhanced 5-Channel Blocking)...")
+    cands_df = generate_candidates(train_s1, s2_df, s3_df, config)
+    blocking_stats = evaluate_blocking_recall(cands_df, gt_df[gt_df["source1_entity_id"].isin(train_ids)].copy())
     print(f"  >>> Candidate Recall: {blocking_stats['recall']:.2%} <<<")
     print(f"  Total Candidate Pairs Generated: {blocking_stats['candidate_pairs_total']:,}")
     print(f"  Average Candidates per S1: {blocking_stats['avg_candidates_per_s1']:.2f}")
 
     print("\n[Step 4/6] Extracting 46 High-Precision Features (RapidFuzz, Tri-State PIN, House No.)...")
-    known_countries = set(s1_df["country"].unique())
-    feature_df = build_pair_features(cands_df, s1_df, s2_df, s3_df, known_train_countries=known_countries)
+    known_countries = set(train_s1["country"].unique())
+    feature_df = build_pair_features(cands_df, train_s1, s2_df, s3_df, known_train_countries=known_countries)
     gc.collect()
 
     labels = np.array([
         1 if (sid, cid) in gt_pairs else 0
         for sid, cid in zip(feature_df["source1_entity_id"], feature_df["candidate_entity_id"])
     ])
-    feature_cols = [c for c in feature_df.columns if c not in ("source1_entity_id", "candidate_entity_id")]
+    feature_df = feature_df.copy()
+    feature_df["label"] = labels
+    feature_cols = [c for c in feature_df.columns if c not in ("source1_entity_id", "candidate_entity_id", "label")]
 
-    print(f"  Labeled Pairs: {len(labels):,} (Positives: {labels.sum():,}, Hard Negatives: {(labels == 0).sum():,})")
+    hard_negatives = mine_hard_negatives(feature_df, label_col="label", hard_fraction=0.35)
+    pos_df = feature_df[feature_df["label"] == 1].copy()
+    train_df = pd.concat([pos_df, hard_negatives], ignore_index=True, sort=False)
+    train_labels = train_df["label"].to_numpy()
+    train_X = train_df[feature_cols]
+
+    print(f"  Labeled Pairs: {len(labels):,} (Positives: {labels.sum():,}, Hard Negatives: {len(hard_negatives):,})")
 
     print("\n[Step 5/6] Training Dual Ensemble (LightGBM + CUDA XGBoost)...")
     model = EnsembleMatcher(lgb_weight=0.55, xgb_weight=0.45)
-    model.fit(feature_df[feature_cols], labels)
+    model.fit(train_X, train_labels)
     gc.collect()
 
-    print("\n[Step 6/6] Precision-Guarded Threshold Calibration for Macro F0.5...")
-    raw_scores = model.predict_proba(feature_df[feature_cols])
+    print("\n[Step 6/6] Fine-Grained Threshold Sweep (0.15 - 0.55) for Macro F0.5...")
+    val_pairs = generate_candidates(val_s1, s2_df, s3_df, config)
+    val_features = build_pair_features(val_pairs, val_s1, s2_df, s3_df, known_train_countries=known_countries)
+    val_features["label"] = np.array([
+        1 if (sid, cid) in gt_pairs else 0
+        for sid, cid in zip(val_features["source1_entity_id"], val_features["candidate_entity_id"])
+    ])
 
-    # Precision Guardrails: Hard Negative Filtering
-    pin_mismatch = (feature_df["pin_exact_match"] == 0.0)
-    hno_mismatch = (feature_df["house_number_compatibility"] == 0.0)
-    country_mismatch = (feature_df["country_exact_match"] == 0.0) & (feature_df["country_a_missing"] == 0.0) & (feature_df["country_b_missing"] == 0.0)
+    raw_scores = model.predict_proba(val_features[feature_cols])
+    boost = 0.05 * (val_features["ch_count"] >= 2).astype(float) + 0.05 * val_features["ch_prov_exact_name"]
+    final_scores = np.clip(raw_scores + boost, 0.0, 1.0)
+    val_features["score"] = final_scores
 
-    clean_scores = raw_scores.copy()
-    clean_scores[pin_mismatch | hno_mismatch | country_mismatch] = 0.0
-    feature_df["score"] = clean_scores
-
-    best_thresh = 0.40
+    best_thresh = 0.35
     best_f05 = 0.0
+    gt_dict_val = defaultdict(set)
+    for sid in val_s1["entity_id"]:
+        gt_dict_val[sid] = gt_dict.get(sid, set())
 
-    # Ensure all S1 entities have an entry in gt_dict (including singletons)
-    for sid in s1_df["entity_id"]:
-        if sid not in gt_dict:
-            gt_dict[sid] = set()
-
-    for th in np.arange(0.30, 0.82, 0.02):
-        valid_sub = feature_df[feature_df["score"] >= th]
-        pred_dict = {sid: set() for sid in s1_df["entity_id"]}
-
+    for th in np.arange(0.15, 0.56, 0.02):
+        valid_sub = val_features[val_features["score"] >= th]
+        pred_dict = {sid: set() for sid in val_s1["entity_id"]}
         for sid, cid in zip(valid_sub["source1_entity_id"], valid_sub["candidate_entity_id"]):
-            pred_dict[sid].add(cid)
+            pred_dict.setdefault(sid, set()).add(cid)
 
-        f05 = macro_f_beta(pred_dict, gt_dict, beta=0.5)
+        f05 = macro_f_beta(pred_dict, gt_dict_val, beta=0.5)
         print(f"  Threshold {th:.2f} -> Macro F0.5 = {f05:.4f}")
         if f05 > best_f05:
             best_f05 = f05

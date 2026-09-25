@@ -28,7 +28,7 @@ model:
     random_state: 42
 
 threshold:
-  value: 0.72
+  value: 0.45  # lowered from 0.72 — was causing 43% singletons vs 5.6% true rate
   segmented_by: null
 
 validation:

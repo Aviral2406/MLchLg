@@ -20,7 +20,7 @@ STOPWORDS = frozenset({
     "enterprise", "services", "india", "us", "usa"
 })
 
-MAX_CANDIDATES_PER_CHANNEL = 35
+MAX_CANDIDATES_PER_CHANNEL = 150
 
 
 def _normalize_all(df: pd.DataFrame) -> dict[str, NormalizedRecord]:
@@ -45,7 +45,7 @@ def channel_a_exact_name(s1_norm: dict[str, NormalizedRecord], candidate_norm: d
 
 
 def channel_b_name_token_overlap(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord], max_token_df: int = 150) -> dict[str, set[str]]:
-    """Inverted index on distinctive name tokens (excluding stopwords and high-DF tokens)."""
+    """Inverted index on distinctive name tokens, keeping singletons when they are informative."""
     token_df = defaultdict(int)
     for rec in candidate_norm.values():
         for token in set(rec.name.tokenized) - STOPWORDS:
@@ -54,7 +54,7 @@ def channel_b_name_token_overlap(s1_norm: dict[str, NormalizedRecord], candidate
     token_to_cids = defaultdict(set)
     for cid, rec in candidate_norm.items():
         for token in set(rec.name.tokenized) - STOPWORDS:
-            if 1 < token_df[token] <= max_token_df:
+            if 0 < token_df[token] <= max_token_df:
                 token_to_cids[token].add(cid)
 
     result = defaultdict(set)
@@ -70,7 +70,7 @@ def channel_b_name_token_overlap(s1_norm: dict[str, NormalizedRecord], candidate
     return result
 
 
-def channel_c_name_char_ngram(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord], top_k: int = 10) -> dict[str, set[str]]:
+def channel_c_name_char_ngram(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord], top_k: int = 30) -> dict[str, set[str]]:
     """Chunked TF-IDF character n-gram cosine retrieval for business names (memory-safe)."""
     if not s1_norm or not candidate_norm:
         return defaultdict(set)
@@ -88,7 +88,6 @@ def channel_c_name_char_ngram(s1_norm: dict[str, NormalizedRecord], candidate_no
         return defaultdict(set)
 
     result = defaultdict(set)
-    # Process S1 in chunks of 5000 to keep memory under 200 MB
     chunk_size = 5000
     for start in range(0, len(s1_ids), chunk_size):
         end = min(start + chunk_size, len(s1_ids))
@@ -105,8 +104,7 @@ def channel_c_name_char_ngram(s1_norm: dict[str, NormalizedRecord], candidate_no
             row = sim_matrix[i]
             if row.nnz == 0:
                 continue
-            # Keep top matches with similarity >= 0.40
-            mask = row.data >= 0.40
+            mask = row.data >= 0.20
             if np.any(mask):
                 valid_indices = row.indices[mask]
                 valid_scores = row.data[mask]
@@ -118,7 +116,7 @@ def channel_c_name_char_ngram(s1_norm: dict[str, NormalizedRecord], candidate_no
 
 
 def channel_d_address_token_overlap(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord], max_token_df: int = 150) -> dict[str, set[str]]:
-    """Inverted index on distinctive address tokens."""
+    """Inverted index on distinctive address tokens, including rare site markers like sector and SBI."""
     token_df = defaultdict(int)
     for rec in candidate_norm.values():
         for token in set(rec.address.tokenized) - STOPWORDS:
@@ -127,7 +125,7 @@ def channel_d_address_token_overlap(s1_norm: dict[str, NormalizedRecord], candid
     token_to_cids = defaultdict(set)
     for cid, rec in candidate_norm.items():
         for token in set(rec.address.tokenized) - STOPWORDS:
-            if 1 < token_df[token] <= max_token_df:
+            if 0 < token_df[token] <= max_token_df:
                 token_to_cids[token].add(cid)
 
     result = defaultdict(set)
@@ -165,12 +163,97 @@ def channel_e_pin_exact(s1_norm: dict[str, NormalizedRecord], candidate_norm: di
     return result
 
 
+def _coarse_address_context_tokens(rec: NormalizedRecord) -> set[str]:
+    return {
+        token for token in rec.address.tokenized
+        if token and token not in STOPWORDS and not token.isdigit() and len(token) > 1
+    }
+
+
+def channel_f_city_state_cooccurrence(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord]) -> dict[str, set[str]]:
+    """Area-context overlap catches same city/state even when business names drift.
+    Uses an inverted index (O(N) build + O(Q*k) lookup) — NOT a brute-force O(N²) loop.
+    The previous nested-loop implementation was broken at real scale (10M+ records).
+    """
+    # Build inverted index: token -> set of candidate ids
+    token_to_cids: dict[str, set[str]] = defaultdict(set)
+    token_df: dict[str, int] = defaultdict(int)
+    for cid, rec in candidate_norm.items():
+        ctx = _coarse_address_context_tokens(rec)
+        for tok in ctx:
+            token_df[tok] += 1
+    # Only index tokens that appear <max_df times to avoid generic city/state explosions
+    max_df = max(200, len(candidate_norm) // 500)  # at most 0.2% of corpus
+    for cid, rec in candidate_norm.items():
+        for tok in _coarse_address_context_tokens(rec):
+            if token_df[tok] <= max_df:
+                token_to_cids[tok].add(cid)
+
+    result: dict[str, set[str]] = defaultdict(set)
+    for sid, rec in s1_norm.items():
+        matched: set[str] = set()
+        for tok in _coarse_address_context_tokens(rec):
+            if tok in token_to_cids:
+                matched |= token_to_cids[tok]
+                if len(matched) >= MAX_CANDIDATES_PER_CHANNEL:
+                    break
+        if matched:
+            result[sid] = set(list(matched)[:MAX_CANDIDATES_PER_CHANNEL])
+    return result
+
+
+def channel_g_address_char_ngram(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord], top_k: int = 30) -> dict[str, set[str]]:
+    """Address char n-gram retrieval catches regional spelling drift and abbreviation noise."""
+    if not s1_norm or not candidate_norm:
+        return defaultdict(set)
+
+    s1_ids = list(s1_norm.keys())
+    cand_ids = list(candidate_norm.keys())
+    s1_texts = [s1_norm[sid].address.normalized for sid in s1_ids]
+    cand_texts = [candidate_norm[cid].address.normalized for cid in cand_ids]
+
+    vectorizer = TfidfVectorizer(analyzer="char", ngram_range=(3, 4), min_df=2, max_features=20000)
+    try:
+        cand_matrix = vectorizer.fit_transform(cand_texts)
+    except ValueError:
+        return defaultdict(set)
+
+    result = defaultdict(set)
+    chunk_size = 5000
+    for start in range(0, len(s1_ids), chunk_size):
+        end = min(start + chunk_size, len(s1_ids))
+        sub_s1_texts = s1_texts[start:end]
+        sub_s1_ids = s1_ids[start:end]
+
+        try:
+            sub_s1_matrix = vectorizer.transform(sub_s1_texts)
+            sim_matrix = sub_s1_matrix.dot(cand_matrix.T)
+        except Exception:
+            continue
+
+        for i, sid in enumerate(sub_s1_ids):
+            row = sim_matrix[i]
+            if row.nnz == 0:
+                continue
+            mask = row.data >= 0.20
+            if np.any(mask):
+                valid_indices = row.indices[mask]
+                valid_scores = row.data[mask]
+                top_order = np.argsort(valid_scores)[-top_k:]
+                for c_idx in valid_indices[top_order]:
+                    result[sid].add(cand_ids[c_idx])
+
+    return result
+
+
 CHANNELS = {
     "exact_name": channel_a_exact_name,
     "name_token_overlap": channel_b_name_token_overlap,
     "name_char_ngram": channel_c_name_char_ngram,
     "address_token_overlap": channel_d_address_token_overlap,
     "pin_exact": channel_e_pin_exact,
+    "city_state_cooccurrence": channel_f_city_state_cooccurrence,
+    "address_char_ngram": channel_g_address_char_ngram,
 }
 
 

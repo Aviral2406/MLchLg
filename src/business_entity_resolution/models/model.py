@@ -15,6 +15,58 @@ def is_cuda_available() -> bool:
         return False
 
 
+def mine_hard_negatives(feature_df: pd.DataFrame, label_col: str = "label",
+                        hard_fraction: float = 0.35, score_columns: list | None = None,
+                        min_candidates: int = 1) -> pd.DataFrame:
+    """Return the top blocked-but-negative pairs that look most like true matches.
+
+    This is the repo's hard-negative mining primitive: it ranks negative candidate pairs
+    by a cheap composite score using the same pairwise features that dominate precision
+    failures (name similarity, address similarity, provenance), then keeps the most
+    confusing negatives for training. The implementation intentionally avoids external
+    data and stays compatible with the challenge's two-stage API.
+    """
+    if feature_df.empty:
+        return feature_df.copy()
+
+    base = feature_df.copy()
+    if label_col not in base.columns:
+        raise KeyError(f"Label column '{label_col}' not found in feature frame")
+
+    negatives = base[base[label_col] == 0].copy()
+    if negatives.empty:
+        return negatives.copy()
+
+    if score_columns is None:
+        score_columns = [
+            "name_char_ngram_jaccard",
+            "address_token_jaccard",
+            "name_token_overlap_coef",
+            "pin_exact_match",
+            "country_exact_match",
+            "ch_count",
+        ]
+
+    composite = pd.DataFrame({"tmp_score": 0.0}, index=negatives.index)
+    for col in score_columns:
+        if col in negatives.columns:
+            composite["tmp_score"] += negatives[col].fillna(0.0)
+
+    # Give a slight boost to candidates surfaced by multiple channels or exact-name
+    # matches; those are the near-misses that most often poison F0.5 precision.
+    if "ch_count" in negatives.columns:
+        composite["tmp_score"] += 0.05 * negatives["ch_count"].fillna(0.0)
+    if "name_exact_normalized" in negatives.columns:
+        composite["tmp_score"] += 0.10 * negatives["name_exact_normalized"].fillna(0.0)
+
+    negatives = negatives.assign(composite_score=composite["tmp_score"].to_numpy())
+    negatives = negatives.sort_values(["composite_score", "candidate_entity_id"], ascending=[False, True])
+
+    n_keep = max(min_candidates, int(round(len(negatives) * max(0.0, min(1.0, hard_fraction)))))
+    n_keep = min(n_keep, len(negatives))
+    return negatives.head(n_keep).copy()
+
+
 class RuleBasedBaseline:
     """Score = simple weighted combination of name/address similarity."""
 
@@ -137,3 +189,21 @@ def build_model(config: dict):
     params = config.get("params", {})
     cls = MODEL_REGISTRY[model_type]
     return cls(**params) if model_type != "baseline" else cls()
+
+
+def save_model(matcher, feature_cols: list, path: str) -> None:
+    """Persist a trained matcher + its feature column list to disk (pickle)."""
+    import pickle, os
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "wb") as f:
+        pickle.dump((matcher, feature_cols), f, protocol=4)
+    print(f"  Model saved to {path}")
+
+
+def load_model(path: str):
+    """Load a previously saved (matcher, feature_cols) tuple."""
+    import pickle
+    with open(path, "rb") as f:
+        matcher, feature_cols = pickle.load(f)
+    print(f"  Model loaded from {path}")
+    return matcher, feature_cols

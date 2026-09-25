@@ -131,22 +131,41 @@ def cross_field_features(name_feats: dict, address_feats: dict, channel_str: str
     }
 
 
-def build_pair_features(pairs_df: pd.DataFrame, s1_df: pd.DataFrame,
-                         s2_df: pd.DataFrame, s3_df: pd.DataFrame,
-                         known_train_countries: set = frozenset()) -> pd.DataFrame:
-    s1_norm = {row["entity_id"]: normalize(row.to_dict()) for _, row in s1_df.iterrows()}
-    cand_all = pd.concat([s2_df, s3_df], ignore_index=True)
-    cand_norm = {row["entity_id"]: normalize(row.to_dict()) for _, row in cand_all.iterrows()}
+def build_pair_features(
+    pairs_df: pd.DataFrame,
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    known_train_countries: set = frozenset(),
+    s1_norm: dict | None = None,
+    cand_norm: dict | None = None,
+) -> pd.DataFrame:
+    """pairs_df: [source1_entity_id, candidate_entity_id, channels].
+    Returns one feature row per pair.
+
+    Accepts pre-built norm dicts (s1_norm, cand_norm) to avoid re-normalizing
+    when called repeatedly (e.g. batched inference). If not provided, normalizes
+    inline from the dataframe arguments.
+    """
+    if s1_norm is None:
+        records = s1_df.to_dict(orient="records")
+        s1_norm = {r["entity_id"]: normalize(r) for r in records}
+    if cand_norm is None:
+        cand_all = pd.concat([s2_df, s3_df], ignore_index=True)
+        records = cand_all.to_dict(orient="records")
+        cand_norm = {r["entity_id"]: normalize(r) for r in records}
 
     rows = []
-    for _, row in pairs_df.iterrows():
-        sid, cid = row["source1_entity_id"], row["candidate_entity_id"]
-        ch_str = str(row.get("channels", "") or "")
-        if cid is None or (isinstance(cid, float) and pd.isna(cid)):
+    for row in pairs_df.itertuples(index=False):
+        sid = row.source1_entity_id
+        cid = row.candidate_entity_id
+        ch_str = str(getattr(row, "channels", "") or "")
+        if not cid or cid != cid:  # None / NaN check
             continue
-        if sid not in s1_norm or cid not in cand_norm:
+        a = s1_norm.get(sid)
+        b = cand_norm.get(cid)
+        if a is None or b is None:
             continue
-        a, b = s1_norm[sid], cand_norm[cid]
         nf = name_features(a, b)
         af = address_features(a, b)
         cf = country_features(a, b, known_train_countries)
