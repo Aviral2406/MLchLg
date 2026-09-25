@@ -1,7 +1,7 @@
 """
-High-Performance, Memory-Safe Training & Threshold Tuning Pipeline.
-Supports Multi-Match Entity Resolution, Fine-Grained Threshold Sweeping (0.15 - 0.55),
-Channel Provenance Prior, and Full 1.73M Test Set Streaming Inference.
+High-Performance, Precision-Guarded Training & Threshold Tuning Pipeline.
+Zeroes out impossible matches (different PIN / house number / country) to eliminate false positives.
+Optimized to push Macro F0.5 > 0.96.
 """
 from __future__ import annotations
 import gc
@@ -80,7 +80,7 @@ def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 400
 def main():
     print("=" * 70)
     print("=== Amazon ML Challenge: Business Entity Resolution Pipeline ===")
-    print("=== Multi-Match High Precision Model (Target Macro F0.5 > 0.96) ===")
+    print("=== Precision-Guarded Model (Target Macro F0.5 > 0.96) ===")
     print("=" * 70)
 
     config_path = ROOT_DIR / "configs" / "pipeline.yaml"
@@ -103,8 +103,8 @@ def main():
     s1_df = load_tsv(str(s1_path), expected_prefix="S1")
     gt_df = load_tsv(str(gt_path))
 
-    # Scale training size to 60,000 S1 records (2x larger training coverage for high precision)
-    TRAIN_SAMPLE_SIZE = 60000
+    # Stratified sample of 45,000 S1 records (optimal balance of convergence & clean negatives)
+    TRAIN_SAMPLE_SIZE = 45000
     if len(s1_df) > TRAIN_SAMPLE_SIZE:
         print(f"  Selecting {TRAIN_SAMPLE_SIZE:,} stratified S1 records for training...")
         s1_df = s1_df.sample(n=TRAIN_SAMPLE_SIZE, random_state=42)
@@ -133,7 +133,7 @@ def main():
     s3_df = load_candidate_pool(s3_path, needed_match_ids, sample_negatives=40000)
     gc.collect()
 
-    print("\n[Step 3/6] Generating Candidates (Enhanced 5-Channel Blocking)...")
+    print("\n[Step 3/6] Generating Candidates (5-Channel Memory-Safe Blocking)...")
     cands_df = generate_candidates(s1_df, s2_df, s3_df, config)
     blocking_stats = evaluate_blocking_recall(cands_df, gt_df)
     print(f"  >>> Candidate Recall: {blocking_stats['recall']:.2%} <<<")
@@ -158,15 +158,19 @@ def main():
     model.fit(feature_df[feature_cols], labels)
     gc.collect()
 
-    print("\n[Step 6/6] Fine-Grained Threshold Sweep (0.15 - 0.55) for Macro F0.5...")
+    print("\n[Step 6/6] Precision-Guarded Threshold Calibration for Macro F0.5...")
     raw_scores = model.predict_proba(feature_df[feature_cols])
 
-    # Provenance Prior: candidates matched by multiple channels or exact name get a small confidence boost
-    boost = 0.05 * (feature_df["ch_count"] >= 2).astype(float) + 0.05 * feature_df["ch_prov_exact_name"]
-    final_scores = np.clip(raw_scores + boost, 0.0, 1.0)
-    feature_df["score"] = final_scores
+    # Precision Guardrails: Hard Negative Filtering
+    pin_mismatch = (feature_df["pin_exact_match"] == 0.0)
+    hno_mismatch = (feature_df["house_number_compatibility"] == 0.0)
+    country_mismatch = (feature_df["country_exact_match"] == 0.0) & (feature_df["country_a_missing"] == 0.0) & (feature_df["country_b_missing"] == 0.0)
 
-    best_thresh = 0.35
+    clean_scores = raw_scores.copy()
+    clean_scores[pin_mismatch | hno_mismatch | country_mismatch] = 0.0
+    feature_df["score"] = clean_scores
+
+    best_thresh = 0.40
     best_f05 = 0.0
 
     # Ensure all S1 entities have an entry in gt_dict (including singletons)
@@ -174,7 +178,7 @@ def main():
         if sid not in gt_dict:
             gt_dict[sid] = set()
 
-    for th in np.arange(0.15, 0.56, 0.02):
+    for th in np.arange(0.30, 0.82, 0.02):
         valid_sub = feature_df[feature_df["score"] >= th]
         pred_dict = {sid: set() for sid in s1_df["entity_id"]}
 
