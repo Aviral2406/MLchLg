@@ -139,23 +139,27 @@ def build_pair_features(
     known_train_countries: set = frozenset(),
     s1_norm: dict | None = None,
     cand_norm: dict | None = None,
+    batch_size: int = 25000,
 ) -> pd.DataFrame:
     """pairs_df: [source1_entity_id, candidate_entity_id, channels].
-    Returns one feature row per pair.
+    Returns one feature row per pair in memory-safe chunks.
 
     Accepts pre-built norm dicts (s1_norm, cand_norm) to avoid re-normalizing
     when called repeatedly (e.g. batched inference). If not provided, normalizes
     inline from the dataframe arguments.
     """
+    if pairs_df.empty:
+        return pd.DataFrame()
+
     if s1_norm is None:
-        records = s1_df.to_dict(orient="records")
-        s1_norm = {r["entity_id"]: normalize(r) for r in records}
+        s1_norm = {row.entity_id: normalize(row._asdict()) for row in s1_df.itertuples(index=False)}
     if cand_norm is None:
         cand_all = pd.concat([s2_df, s3_df], ignore_index=True)
-        records = cand_all.to_dict(orient="records")
-        cand_norm = {r["entity_id"]: normalize(r) for r in records}
+        cand_norm = {row.entity_id: normalize(row._asdict()) for row in cand_all.itertuples(index=False)}
 
-    rows = []
+    chunk_dfs = []
+    chunk_rows = []
+
     for row in pairs_df.itertuples(index=False):
         sid = row.source1_entity_id
         cid = row.candidate_entity_id
@@ -170,6 +174,19 @@ def build_pair_features(
         af = address_features(a, b)
         cf = country_features(a, b, known_train_countries)
         xf = cross_field_features(nf, af, ch_str)
-        rows.append({"source1_entity_id": sid, "candidate_entity_id": cid, **nf, **af, **cf, **xf})
+        chunk_rows.append({"source1_entity_id": sid, "candidate_entity_id": cid, **nf, **af, **cf, **xf})
 
-    return pd.DataFrame(rows)
+        if len(chunk_rows) >= batch_size:
+            chunk_dfs.append(pd.DataFrame(chunk_rows))
+            chunk_rows = []
+
+    if chunk_rows:
+        chunk_dfs.append(pd.DataFrame(chunk_rows))
+        chunk_rows = []
+
+    if not chunk_dfs:
+        return pd.DataFrame()
+
+    out_df = pd.concat(chunk_dfs, ignore_index=True)
+    del chunk_dfs
+    return out_df

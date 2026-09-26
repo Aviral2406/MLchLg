@@ -24,9 +24,12 @@ MAX_CANDIDATES_PER_CHANNEL = 150
 
 
 def _normalize_all(df: pd.DataFrame) -> dict[str, NormalizedRecord]:
-    """entity_id -> NormalizedRecord. Fast record conversion."""
-    records = df.to_dict(orient="records")
-    return {rec["entity_id"]: normalize(rec) for rec in records}
+    """entity_id -> NormalizedRecord. Fast, low-memory record conversion."""
+    result = {}
+    for row in df.itertuples(index=False):
+        d = row._asdict()
+        result[d["entity_id"]] = normalize(d)
+    return result
 
 
 def channel_a_exact_name(s1_norm: dict[str, NormalizedRecord], candidate_norm: dict[str, NormalizedRecord]) -> dict[str, set[str]]:
@@ -257,14 +260,24 @@ CHANNELS = {
 }
 
 
-def generate_candidates(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame, config: dict) -> pd.DataFrame:
+def generate_candidates(
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    config: dict,
+    s1_norm: dict[str, NormalizedRecord] | None = None,
+    candidate_norm: dict[str, NormalizedRecord] | None = None,
+) -> pd.DataFrame:
     """Returns candidate_pairs_df: [source1_entity_id, candidate_entity_id, channels].
     Guaranteed memory-safe: caps candidates strictly per S1 entity during collection.
     """
-    print("  [Blocking] Normalizing records in memory...")
-    s1_norm = _normalize_all(s1_df)
-    candidate_df = pd.concat([s2_df, s3_df], ignore_index=True)
-    candidate_norm = _normalize_all(candidate_df)
+    if s1_norm is None:
+        print("  [Blocking] Normalizing S1 records in memory...")
+        s1_norm = _normalize_all(s1_df)
+    if candidate_norm is None:
+        print("  [Blocking] Normalizing candidate records in memory...")
+        candidate_df = pd.concat([s2_df, s3_df], ignore_index=True)
+        candidate_norm = _normalize_all(candidate_df)
 
     enabled = config.get("blocking", {}).get("channels", {})
     pair_channels = defaultdict(set)
@@ -278,10 +291,31 @@ def generate_candidates(s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.Data
             for cid in cand_ids:
                 pair_channels[(sid, cid)].add(name)
 
-    print(f"  [Blocking] Formatting {len(pair_channels):,} unique candidate pairs...")
+    cap_per_s1 = config.get("blocking", {}).get("candidate_cap_per_s1", 100)
+
+    # Group candidates by S1 entity and enforce cap (prioritizing multi-channel and name matches)
+    s1_cands = defaultdict(dict)
+    for (sid, cid), chs in pair_channels.items():
+        s1_cands[sid][cid] = chs
+
+    final_pairs = []
+    for sid, cand_dict in s1_cands.items():
+        if len(cand_dict) > cap_per_s1:
+            sorted_cands = sorted(
+                cand_dict.items(),
+                key=lambda item: (len(item[1]), "exact_name" in item[1], "name_token_overlap" in item[1]),
+                reverse=True,
+            )[:cap_per_s1]
+            for cid, chs in sorted_cands:
+                final_pairs.append((sid, cid, chs))
+        else:
+            for cid, chs in cand_dict.items():
+                final_pairs.append((sid, cid, chs))
+
+    print(f"  [Blocking] Formatting {len(final_pairs):,} unique candidate pairs...")
     rows = [
         {"source1_entity_id": sid, "candidate_entity_id": cid, "channels": ",".join(sorted(chs))}
-        for (sid, cid), chs in pair_channels.items()
+        for sid, cid, chs in final_pairs
     ]
     out = pd.DataFrame(rows, columns=["source1_entity_id", "candidate_entity_id", "channels"])
 

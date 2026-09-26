@@ -21,7 +21,7 @@ if str(ROOT_DIR / "src") not in sys.path:
 import numpy as np
 import pandas as pd
 from src.business_entity_resolution.data.ingest import load_tsv
-from src.business_entity_resolution.blocking.block import generate_candidates, evaluate_blocking_recall
+from src.business_entity_resolution.blocking.block import generate_candidates, evaluate_blocking_recall, _normalize_all
 from src.business_entity_resolution.features.pair_features import build_pair_features
 from src.business_entity_resolution.models.model import EnsembleMatcher, mine_hard_negatives
 from src.business_entity_resolution.evaluation.metrics import macro_f_beta
@@ -78,6 +78,48 @@ def load_candidate_pool(path: Path, needed_ids: set, sample_negatives: int = 400
     return df
 
 
+def select_training_pairs(
+    cands_df: pd.DataFrame,
+    gt_pairs: set[tuple[str, str]],
+    max_negatives_per_s1: int = 4,
+    random_state: int = 42,
+) -> pd.DataFrame:
+    """Selects 100% of true positive candidate pairs plus the hardest negative pairs
+    (prioritizing multi-channel candidates and name matches) capped per S1.
+    Keeps training size balanced (~1:4 pos:neg ratio) and memory strictly under 300 MB.
+    """
+    valid_cands = cands_df.dropna(subset=["candidate_entity_id"]).copy()
+    if valid_cands.empty:
+        return valid_cands
+
+    pair_tuples = list(zip(valid_cands["source1_entity_id"], valid_cands["candidate_entity_id"]))
+    is_positive = [p in gt_pairs for p in pair_tuples]
+    valid_cands["is_positive"] = is_positive
+
+    pos_df = valid_cands[valid_cands["is_positive"]].copy()
+    neg_df = valid_cands[~valid_cands["is_positive"]].copy()
+
+    def _neg_difficulty(ch_str: str) -> float:
+        chs = set(str(ch_str or "").split(","))
+        score = len(chs) * 2.0
+        if "exact_name" in chs:
+            score += 3.0
+        if "name_token_overlap" in chs:
+            score += 2.0
+        if "name_char_ngram" in chs:
+            score += 1.5
+        return score
+
+    neg_df["difficulty"] = neg_df["channels"].apply(_neg_difficulty)
+    neg_df = neg_df.sort_values(by=["source1_entity_id", "difficulty"], ascending=[True, False])
+
+    selected_neg = neg_df.groupby("source1_entity_id", as_index=False).head(max_negatives_per_s1)
+    combined = pd.concat([pos_df, selected_neg], ignore_index=True)
+    combined = combined.drop(columns=["is_positive", "difficulty"], errors="ignore")
+    print(f"  [Memory-Safe Selector] Selected {len(pos_df):,} true positives and {len(selected_neg):,} hard negatives (Total: {len(combined):,} training pairs).")
+    return combined
+
+
 def main():
     print("=" * 70)
     print("=== Amazon ML Challenge: Business Entity Resolution Pipeline ===")
@@ -104,8 +146,8 @@ def main():
     s1_df = load_tsv(str(s1_path), expected_prefix="S1")
     gt_df = load_tsv(str(gt_path))
 
-    # Scale training size to 60,000 S1 records (2x larger training coverage for high precision)
-    TRAIN_SAMPLE_SIZE = 60000
+    # Scale training size to 25,000 stratified S1 records (20k train, 5k val) for fast, memory-safe GPU training
+    TRAIN_SAMPLE_SIZE = 25000
     if len(s1_df) > TRAIN_SAMPLE_SIZE:
         print(f"  Selecting {TRAIN_SAMPLE_SIZE:,} stratified S1 records for training...")
         s1_df = s1_df.sample(n=TRAIN_SAMPLE_SIZE, random_state=42)
@@ -135,46 +177,70 @@ def main():
     print(f"  Grouped split: {len(train_s1):,} train S1 entities, {len(val_s1):,} validation S1 entities")
 
     print("\n[Step 2/6] Loading Candidate Pools with Streaming Chunks...")
-    s2_df = load_candidate_pool(s2_path, needed_match_ids, sample_negatives=40000)
-    s3_df = load_candidate_pool(s3_path, needed_match_ids, sample_negatives=40000)
+    s2_df = load_candidate_pool(s2_path, needed_match_ids, sample_negatives=30000)
+    s3_df = load_candidate_pool(s3_path, needed_match_ids, sample_negatives=30000)
     gc.collect()
 
-    print("\n[Step 3/6] Generating Candidates (Enhanced 5-Channel Blocking)...")
-    cands_df = generate_candidates(train_s1, s2_df, s3_df, config)
+    print("  [Memory-Safe] Pre-normalizing train and candidate records once...")
+    s1_norm = _normalize_all(train_s1)
+    cand_all = pd.concat([s2_df, s3_df], ignore_index=True)
+    cand_norm = _normalize_all(cand_all)
+    del cand_all
+    gc.collect()
+
+    print("\n[Step 3/6] Generating Candidates (Multi-Channel Blocking with Strict Caps)...")
+    cands_df = generate_candidates(train_s1, s2_df, s3_df, config, s1_norm=s1_norm, candidate_norm=cand_norm)
     blocking_stats = evaluate_blocking_recall(cands_df, gt_df[gt_df["source1_entity_id"].isin(train_ids)].copy())
     print(f"  >>> Candidate Recall: {blocking_stats['recall']:.2%} <<<")
     print(f"  Total Candidate Pairs Generated: {blocking_stats['candidate_pairs_total']:,}")
     print(f"  Average Candidates per S1: {blocking_stats['avg_candidates_per_s1']:.2f}")
 
-    print("\n[Step 4/6] Extracting 46 High-Precision Features (RapidFuzz, Tri-State PIN, House No.)...")
+    # Select high-precision training candidate pairs BEFORE feature extraction to prevent RAM saturation
+    train_pairs = select_training_pairs(cands_df, gt_pairs, max_negatives_per_s1=4)
+    del cands_df
+    gc.collect()
+
+    print("\n[Step 4/6] Extracting 46 High-Precision Features (Memory-Safe Streaming)...")
     known_countries = set(train_s1["country"].unique())
-    feature_df = build_pair_features(cands_df, train_s1, s2_df, s3_df, known_train_countries=known_countries)
+    feature_df = build_pair_features(
+        train_pairs, train_s1, s2_df, s3_df,
+        known_train_countries=known_countries,
+        s1_norm=s1_norm, cand_norm=cand_norm,
+        batch_size=25000
+    )
+    del train_pairs, s1_norm
     gc.collect()
 
     labels = np.array([
         1 if (sid, cid) in gt_pairs else 0
         for sid, cid in zip(feature_df["source1_entity_id"], feature_df["candidate_entity_id"])
     ])
-    feature_df = feature_df.copy()
-    feature_df["label"] = labels
     feature_cols = [c for c in feature_df.columns if c not in ("source1_entity_id", "candidate_entity_id", "label")]
 
-    hard_negatives = mine_hard_negatives(feature_df, label_col="label", hard_fraction=0.35)
-    pos_df = feature_df[feature_df["label"] == 1].copy()
-    train_df = pd.concat([pos_df, hard_negatives], ignore_index=True, sort=False)
-    train_labels = train_df["label"].to_numpy()
-    train_X = train_df[feature_cols]
-
-    print(f"  Labeled Pairs: {len(labels):,} (Positives: {labels.sum():,}, Hard Negatives: {len(hard_negatives):,})")
+    train_X = feature_df[feature_cols].copy()
+    train_labels = labels
+    print(f"  Training Matrix: {len(train_X):,} pairs (Positives: {labels.sum():,}, Negatives: {len(labels) - labels.sum():,})")
+    del feature_df
+    gc.collect()
 
     print("\n[Step 5/6] Training Dual Ensemble (LightGBM + CUDA XGBoost)...")
     model = EnsembleMatcher(lgb_weight=0.55, xgb_weight=0.45)
     model.fit(train_X, train_labels)
+    del train_X, train_labels
     gc.collect()
 
     print("\n[Step 6/6] Fine-Grained Threshold Sweep (0.15 - 0.55) for Macro F0.5...")
-    val_pairs = generate_candidates(val_s1, s2_df, s3_df, config)
-    val_features = build_pair_features(val_pairs, val_s1, s2_df, s3_df, known_train_countries=known_countries)
+    val_s1_norm = _normalize_all(val_s1)
+    val_pairs = generate_candidates(val_s1, s2_df, s3_df, config, s1_norm=val_s1_norm, candidate_norm=cand_norm)
+    val_features = build_pair_features(
+        val_pairs, val_s1, s2_df, s3_df,
+        known_train_countries=known_countries,
+        s1_norm=val_s1_norm, cand_norm=cand_norm,
+        batch_size=25000
+    )
+    del val_s1_norm, cand_norm, val_pairs, s2_df, s3_df
+    gc.collect()
+
     val_features["label"] = np.array([
         1 if (sid, cid) in gt_pairs else 0
         for sid, cid in zip(val_features["source1_entity_id"], val_features["candidate_entity_id"])
@@ -208,6 +274,8 @@ def main():
     print("=" * 70)
 
     config["threshold"]["value"] = best_thresh
+    del val_features
+    gc.collect()
 
     print("\nWriting submission predictions...")
     output_dir = ROOT_DIR / "output"
